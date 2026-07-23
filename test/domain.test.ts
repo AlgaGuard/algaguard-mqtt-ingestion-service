@@ -242,3 +242,84 @@ test("Telemetry stale-context response triggers one authoritative re-resolution"
   assert.equal(resolutions, 2);
   assert.deepEqual(forwardedVersions, ["1", "2"]);
 });
+
+test("untrusted broker identity values are rejected with distinct metrics", async () => {
+  const service = new IngestionService(
+    new MemoryIngestionRepository(),
+    resolve,
+  );
+  const result = await service.ingest(
+    "algaguard/v1/devices/AG-000001/telemetry",
+    envelope,
+    {
+      source: "proxy-header",
+      verified: false,
+      deviceId: "AG-000001",
+    } as never,
+    async () => acceptedOutcome,
+  );
+  assert.deepEqual(result, {
+    status: "REJECTED",
+    reason: "UNTRUSTED_BROKER_IDENTITY",
+  });
+  assert.match(
+    service.metrics.render(),
+    /algaguard_ingestion_credential_mismatch_total 1/,
+  );
+  assert.match(
+    service.metrics.render(),
+    /algaguard_ingestion_mtls_accepted_total 0/,
+  );
+});
+
+test("revoked context and configured batch bounds are rejected observably", async () => {
+  const revoked = new IngestionService(
+    new MemoryIngestionRepository(),
+    async () => {
+      throw new DeviceContextError("CREDENTIAL_REVOKED");
+    },
+  );
+  assert.equal(
+    (
+      await revoked.ingest(
+        "algaguard/v1/devices/AG-000001/telemetry",
+        envelope,
+        "AG-000001",
+        async () => acceptedOutcome,
+      )
+    ).status,
+    "REJECTED",
+  );
+  assert.match(
+    revoked.metrics.render(),
+    /algaguard_ingestion_revoked_expired_credential_total 1/,
+  );
+
+  const bounded = new IngestionService(
+    new MemoryIngestionRepository(),
+    resolve,
+    undefined,
+    1,
+  );
+  const oversized = {
+    ...envelope,
+    payload: {
+      ...envelope.payload,
+      sampleCount: 2,
+      lastSequence: "2",
+      samples: [
+        envelope.payload.samples[0],
+        { ...envelope.payload.samples[0], sequence: "2" },
+      ],
+    },
+  };
+  assert.deepEqual(
+    await bounded.ingest(
+      "algaguard/v1/devices/AG-000001/telemetry",
+      oversized,
+      "AG-000001",
+      async () => acceptedOutcome,
+    ),
+    { status: "REJECTED", reason: "BATCH_LIMIT_EXCEEDED" },
+  );
+});

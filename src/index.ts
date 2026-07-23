@@ -9,19 +9,27 @@ import { resolveDeviceContext } from "./device-context.js";
 
 const config = loadConfig();
 const repository = new PostgresIngestionRepository(createPostgresPool(config));
-const service = new IngestionService(repository, resolveDeviceContext);
-const server = buildApp(repository, service).listen(config.PORT, () => {
-  process.stdout.write(
-    `${JSON.stringify({
-      level: "info",
-      service: "algaguard-mqtt-ingestion-service",
-      message: "listening",
-      port: config.PORT,
-    })}\n`,
-  );
-});
+const service = new IngestionService(
+  repository,
+  resolveDeviceContext,
+  undefined,
+  config.MQTT_MAX_SAMPLES_PER_BATCH,
+);
+const server = buildApp(repository, service, config.HTTP_BODY_LIMIT).listen(
+  config.PORT,
+  () => {
+    process.stdout.write(
+      `${JSON.stringify({
+        level: "info",
+        service: "algaguard-mqtt-ingestion-service",
+        message: "listening",
+        port: config.PORT,
+      })}\n`,
+    );
+  },
+);
 await once(server, "listening");
-const mqttClient = await startMqttIngestion(service);
+const mqttClient = await startMqttIngestion(service, config);
 
 async function shutdown(signal: string) {
   process.stdout.write(

@@ -18,3 +18,17 @@ test("unknown routes use problem details", async () => {
     /application\/problem\+json/,
   );
 });
+
+test("HTTP cannot supply broker or certificate identity headers", async () => {
+  for (const header of [
+    "x-device-id",
+    "x-authenticated-device-id",
+    "x-client-cert",
+  ]) {
+    const response = await request(buildApp())
+      .get("/health/live")
+      .set(header, "spoofed");
+    assert.equal(response.status, 400);
+    assert.equal(response.body.code, "UNTRUSTED_PROXY_IDENTITY");
+  }
+});

@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import mqtt, { type MqttClient } from "mqtt";
+import type { ServiceConfig } from "./config.js";
 import {
+  brokerAuthenticatedIdentity,
   topicDevice,
   StaleDeviceContextError,
   type IngestionService,
@@ -103,31 +106,60 @@ function acknowledgement(envelope: MqttEnvelope, outcome: TelemetryOutcome) {
 
 export async function startMqttIngestion(
   service: IngestionService,
+  config: ServiceConfig,
 ): Promise<MqttClient | undefined> {
-  const url = process.env.MQTT_URL;
+  const url = config.MQTT_URL;
   if (!url) return undefined;
-  const username = process.env.MQTT_USERNAME;
-  const password = process.env.MQTT_PASSWORD;
-  if (!username || !password)
-    throw new Error("MQTT_USERNAME and MQTT_PASSWORD are required");
+  const [ca, cert, key] = await Promise.all([
+    readFile(config.MQTT_CA_PATH!),
+    readFile(config.MQTT_CERTIFICATE_PATH!),
+    readFile(config.MQTT_PRIVATE_KEY_PATH!),
+  ]);
   const client = await mqtt.connectAsync(url, {
-    clientId: `algaguard-ingestion-${randomUUID()}`,
-    username,
-    password,
-    clean: true,
-    reconnectPeriod: 2_000,
+    clientId: config.MQTT_CLIENT_ID,
+    ca,
+    cert,
+    key,
+    servername: config.MQTT_SERVER_NAME!,
+    rejectUnauthorized: true,
+    protocolVersion: 5,
+    clean: false,
+    keepalive: config.MQTT_KEEPALIVE_SECONDS,
+    reconnectPeriod: config.MQTT_RECONNECT_DELAY_MS,
+    queueQoSZero: false,
+    properties: {
+      maximumPacketSize: config.MQTT_MAX_PACKET_BYTES,
+      receiveMaximum: config.MQTT_QOS1_INFLIGHT,
+      sessionExpiryInterval: config.MQTT_SESSION_EXPIRY_SECONDS,
+    },
   });
   await client.subscribeAsync("algaguard/v1/devices/+/telemetry", { qos: 1 });
+  let rateWindowStarted = Date.now();
+  let messagesInWindow = 0;
   client.on("message", (topic, bytes) => {
     void (async () => {
       try {
+        if (Date.now() - rateWindowStarted >= 1000) {
+          rateWindowStarted = Date.now();
+          messagesInWindow = 0;
+        }
+        messagesInWindow += 1;
+        if (messagesInWindow > config.MQTT_MAX_MESSAGES_PER_SECOND) {
+          service.metrics.increment("rate_limited");
+          return;
+        }
+        if (bytes.length > config.MQTT_MAX_PACKET_BYTES) {
+          service.metrics.increment("rejected");
+          return;
+        }
         const envelope = JSON.parse(bytes.toString()) as unknown;
-        // The broker ACL authenticates this topic segment; infrastructure tests prove the mapping.
-        const authenticatedDeviceId = topicDevice(topic) ?? "";
+        // This subscriber is the sole process boundary that can construct the
+        // broker-authenticated identity. EMQX mTLS and ACL tests prove the topic binding.
+        const identity = brokerAuthenticatedIdentity(topicDevice(topic) ?? "");
         const result = await service.ingest(
           topic,
           envelope,
-          authenticatedDeviceId,
+          identity,
           forwardTelemetry,
         );
         if (result.status === "REJECTED" && "reason" in result) return;

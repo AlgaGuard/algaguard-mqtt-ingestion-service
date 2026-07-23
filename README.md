@@ -4,7 +4,9 @@ The service subscribes only to the canonical device telemetry topic, validates t
 
 Device context is resolved for every valid delivery. There is intentionally no local ownership cache, so a lifecycle change or transfer is effective on the next delivery without an invalidation race. Resolution and rejection counters are exposed with the existing ingestion metrics.
 
-Message outcomes are stored in PostgreSQL by `messageId`, so delivery retries remain idempotent after process or database-client restarts. Service MQTT credentials are supplied at runtime; no broker or identity secret is committed. The EMQX ACL configuration is responsible for binding each authenticated device principal to its own topic segment.
+Message outcomes are stored in PostgreSQL by `messageId`, so delivery retries remain idempotent after process or database-client restarts. The ingestion subscriber itself uses a separately scoped service certificate over `mqtts`; device shared credentials are never accepted. Only that protected subscriber constructs the broker-authenticated identity value. HTTP requests carrying proxy identity headers are rejected, and the EMQX ACL configuration is responsible for binding each authenticated device principal to its own topic segment.
+
+MQTT packet size, batch samples, QoS1 inflight count, keepalive, session expiry, reconnect delay, and message rate are bounded and environment-configurable. Metrics separately expose mTLS-accepted deliveries, credential mismatches, revoked/expired context rejections, and topic identity mismatches. Certificate bodies and private keys are not logged.
 
 ## Validate
 
