@@ -1,85 +1,149 @@
 import { randomUUID } from "node:crypto";
 import mqtt, { type MqttClient } from "mqtt";
-import { IngestionService, type MqttEnvelope } from "./domain.js";
+import {
+  topicDevice,
+  type IngestionService,
+  type MqttEnvelope,
+  type TelemetryOutcome,
+} from "./domain.js";
 
-export async function forwardTelemetry(envelope: MqttEnvelope) {
-  const payload = envelope.payload as {
-    batchId?: unknown;
-    samples?: unknown;
+let cachedToken: { value: string; expiresAt: number } | undefined;
+
+async function serviceToken() {
+  if (cachedToken && cachedToken.expiresAt > Date.now() + 10_000)
+    return cachedToken.value;
+  const issuer =
+    process.env.KEYCLOAK_ISSUER ?? "http://keycloak:8080/realms/algaguard";
+  const secret = process.env.SERVICE_CLIENT_SECRET;
+  if (!secret) throw new Error("SERVICE_CLIENT_SECRET is required");
+  const response = await fetch(`${issuer}/protocol/openid-connect/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id:
+        process.env.SERVICE_CLIENT_ID ?? "algaguard-mqtt-ingestion-service",
+      client_secret: secret,
+    }),
+  });
+  if (!response.ok) throw new Error("Service authentication failed");
+  const body = (await response.json()) as {
+    access_token?: string;
+    expires_in?: number;
   };
-  const response = await fetch(
-    `${process.env.TELEMETRY_SERVICE_URL ?? "http://telemetry-service:3000"}/v1/ingestion/batches`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        batchId: payload.batchId,
-        deviceId: envelope.deviceId,
-        samples: payload.samples,
-      }),
-    },
-  );
-  if (!response.ok) {
-    throw new Error(`Telemetry durable commit failed with ${response.status}`);
-  }
+  if (!body.access_token) throw new Error("Service token response invalid");
+  cachedToken = {
+    value: body.access_token,
+    expiresAt: Date.now() + (body.expires_in ?? 30) * 1000,
+  };
+  return cachedToken.value;
 }
 
-function acknowledgement(envelope: MqttEnvelope, duplicate: boolean) {
-  const payload = envelope.payload as {
-    batchId?: string;
-    lastSequence?: string;
-  };
+export async function forwardTelemetry(
+  envelope: MqttEnvelope,
+  onRetry: () => void = () => {},
+): Promise<TelemetryOutcome> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(
+        `${process.env.TELEMETRY_SERVICE_URL ?? "http://telemetry-service:3000"}/v1/ingestion/batches`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${await serviceToken()}`,
+            "x-correlation-id": envelope.correlationId ?? envelope.messageId,
+          },
+          body: JSON.stringify({
+            batchId: envelope.payload.batchId,
+            deviceId: envelope.deviceId,
+            samples: envelope.payload.samples,
+          }),
+        },
+      );
+      if (response.ok) return (await response.json()) as TelemetryOutcome;
+      lastError = new Error(`Telemetry rejected batch with ${response.status}`);
+      if (response.status < 500) throw lastError;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 2) {
+      onRetry();
+      await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Telemetry durable commit failed");
+}
+
+function acknowledgement(envelope: MqttEnvelope, outcome: TelemetryOutcome) {
   return {
     schema: "urn:algaguard:schema:mqtt:telemetry-ack:v1",
     schemaVersion: "1.0.0",
     messageId: randomUUID(),
     deviceId: envelope.deviceId,
     sentAt: new Date().toISOString(),
-    correlationId: envelope.messageId,
+    correlationId: envelope.correlationId ?? envelope.messageId,
     payload: {
       ackId: randomUUID(),
-      batchId: payload.batchId,
-      status: "ACCEPTED",
-      acceptedThroughSequence: payload.lastSequence,
-      receivedAt: new Date().toISOString(),
-      duplicate,
+      batchId: envelope.payload.batchId,
+      status: outcome.status,
+      acceptedThroughSequence: outcome.acceptedThroughSequence,
+      receivedAt: outcome.receivedAt,
+      duplicate: outcome.duplicate,
+      ...(outcome.rejectedSequences
+        ? { rejectedSequences: outcome.rejectedSequences }
+        : {}),
+      ...(outcome.errors ? { errors: outcome.errors } : {}),
     },
   };
 }
 
 export async function startMqttIngestion(
-  service = new IngestionService(),
+  service: IngestionService,
 ): Promise<MqttClient | undefined> {
   const url = process.env.MQTT_URL;
   if (!url) return undefined;
-  const options = {
+  const username = process.env.MQTT_USERNAME;
+  const password = process.env.MQTT_PASSWORD;
+  if (!username || !password)
+    throw new Error("MQTT_USERNAME and MQTT_PASSWORD are required");
+  const client = await mqtt.connectAsync(url, {
     clientId: `algaguard-ingestion-${randomUUID()}`,
-    username: "development-ingestion",
+    username,
+    password,
     clean: true,
     reconnectPeriod: 2_000,
-  };
-  const client = await mqtt.connectAsync(url, options);
-  await client.subscribeAsync("algaguard/v1/devices/#", { qos: 1 });
+  });
+  await client.subscribeAsync("algaguard/v1/devices/+/telemetry", { qos: 1 });
   client.on("message", (topic, bytes) => {
-    if (!topic.endsWith("/telemetry")) return;
     void (async () => {
       try {
-        const envelope = JSON.parse(bytes.toString()) as MqttEnvelope;
-        const result = await service.ingest(topic, envelope, forwardTelemetry);
-        process.stdout.write(
-          `${JSON.stringify({ level: "info", component: "mqtt-ingestion", topic, deviceId: envelope.deviceId, status: result.status })}\n`,
+        const envelope = JSON.parse(bytes.toString()) as unknown;
+        // The broker ACL authenticates this topic segment; infrastructure tests prove the mapping.
+        const authenticatedDeviceId = topicDevice(topic) ?? "";
+        const result = await service.ingest(
+          topic,
+          envelope,
+          authenticatedDeviceId,
+          forwardTelemetry,
         );
-        if (result.status === "REJECTED") return;
+        if (result.status === "REJECTED" && "reason" in result) return;
+        const parsed = envelope as MqttEnvelope;
         await client.publishAsync(
-          `algaguard/v1/devices/${envelope.deviceId}/telemetry/ack`,
-          JSON.stringify(
-            acknowledgement(envelope, result.status === "DUPLICATE"),
-          ),
+          `algaguard/v1/devices/${parsed.deviceId}/telemetry/ack`,
+          JSON.stringify(acknowledgement(parsed, result.outcome)),
           { qos: 1, retain: false },
         );
       } catch (error) {
         process.stderr.write(
-          `${JSON.stringify({ level: "error", component: "mqtt-ingestion", message: error instanceof Error ? error.message : "unknown error" })}\n`,
+          `${JSON.stringify({
+            level: "error",
+            component: "mqtt-ingestion",
+            message: error instanceof Error ? error.message : "unknown error",
+          })}\n`,
         );
       }
     })();

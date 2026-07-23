@@ -5,7 +5,12 @@ import express, {
 } from "express";
 import { trace } from "@opentelemetry/api";
 import pino from "pino";
-import { router } from "./routes.js";
+import {
+  IngestionService,
+  MemoryIngestionRepository,
+  type IngestionRepository,
+} from "./domain.js";
+import { createRouter } from "./routes.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 const requestContext: RequestHandler = (request, response, next) => {
@@ -33,7 +38,10 @@ const requestContext: RequestHandler = (request, response, next) => {
   next();
 };
 
-export function buildApp() {
+export function buildApp(
+  repository: IngestionRepository = new MemoryIngestionRepository(),
+  service = new IngestionService(repository),
+) {
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));
@@ -44,14 +52,23 @@ export function buildApp() {
       service: "algaguard-mqtt-ingestion-service",
     }),
   );
-  app.get("/health/ready", (_request, response) =>
-    response.json({
-      status: "READY",
-      service: "algaguard-mqtt-ingestion-service",
-      dependencies: "configured",
-    }),
-  );
-  app.use("/v1", router);
+  app.get("/health/ready", async (_request, response) => {
+    try {
+      await repository.health();
+      response.json({
+        status: "READY",
+        service: "algaguard-mqtt-ingestion-service",
+        dependencies: { postgres: "UP" },
+      });
+    } catch {
+      response.status(503).json({
+        status: "NOT_READY",
+        service: "algaguard-mqtt-ingestion-service",
+        dependencies: { postgres: "DOWN" },
+      });
+    }
+  });
+  app.use("/v1", createRouter(service));
   app.use((_request, response) =>
     response
       .status(404)
