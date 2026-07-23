@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import pg from "pg";
 import { IngestionService } from "../src/domain.js";
 import { PostgresIngestionRepository } from "../src/repository.js";
-import { acceptedOutcome, envelope } from "./fixtures.js";
+import { acceptedOutcome, activeContext, envelope } from "./fixtures.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -15,7 +15,10 @@ test(
     await pool1.query("TRUNCATE ingestion_messages");
     const repository1 = new PostgresIngestionRepository(pool1);
     let forwards = 0;
-    const first = await new IngestionService(repository1).ingest(
+    const first = await new IngestionService(
+      repository1,
+      async () => activeContext,
+    ).ingest(
       "algaguard/v1/devices/AG-000001/telemetry",
       envelope,
       "AG-000001",
@@ -29,7 +32,10 @@ test(
 
     const pool2 = new pg.Pool({ connectionString: databaseUrl });
     const repository2 = new PostgresIngestionRepository(pool2);
-    const duplicate = await new IngestionService(repository2).ingest(
+    const duplicate = await new IngestionService(
+      repository2,
+      async () => activeContext,
+    ).ingest(
       "algaguard/v1/devices/AG-000001/telemetry",
       envelope,
       "AG-000001",

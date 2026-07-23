@@ -10,6 +10,7 @@ import {
   MemoryIngestionRepository,
   type IngestionRepository,
 } from "./domain.js";
+import { resolveDeviceContext } from "./device-context.js";
 import { createRouter } from "./routes.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
@@ -40,7 +41,7 @@ const requestContext: RequestHandler = (request, response, next) => {
 
 export function buildApp(
   repository: IngestionRepository = new MemoryIngestionRepository(),
-  service = new IngestionService(repository),
+  service = new IngestionService(repository, resolveDeviceContext),
 ) {
   const app = express();
   app.disable("x-powered-by");

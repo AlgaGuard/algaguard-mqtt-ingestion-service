@@ -5,10 +5,11 @@ import { loadConfig } from "./config.js";
 import { IngestionService } from "./domain.js";
 import { PostgresIngestionRepository } from "./repository.js";
 import { startMqttIngestion } from "./transport.js";
+import { resolveDeviceContext } from "./device-context.js";
 
 const config = loadConfig();
 const repository = new PostgresIngestionRepository(createPostgresPool(config));
-const service = new IngestionService(repository);
+const service = new IngestionService(repository, resolveDeviceContext);
 const server = buildApp(repository, service).listen(config.PORT, () => {
   process.stdout.write(
     `${JSON.stringify({

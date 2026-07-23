@@ -5,6 +5,7 @@ import {
   type IngestionService,
   type MqttEnvelope,
   type TelemetryOutcome,
+  type TrustedTelemetryBatch,
 } from "./domain.js";
 
 let cachedToken: { value: string; expiresAt: number } | undefined;
@@ -40,7 +41,7 @@ async function serviceToken() {
 }
 
 export async function forwardTelemetry(
-  envelope: MqttEnvelope,
+  batch: TrustedTelemetryBatch,
   onRetry: () => void = () => {},
 ): Promise<TelemetryOutcome> {
   let lastError: unknown;
@@ -53,13 +54,9 @@ export async function forwardTelemetry(
           headers: {
             "content-type": "application/json",
             authorization: `Bearer ${await serviceToken()}`,
-            "x-correlation-id": envelope.correlationId ?? envelope.messageId,
+            "x-correlation-id": batch.correlationId,
           },
-          body: JSON.stringify({
-            batchId: envelope.payload.batchId,
-            deviceId: envelope.deviceId,
-            samples: envelope.payload.samples,
-          }),
+          body: JSON.stringify(batch),
         },
       );
       if (response.ok) return (await response.json()) as TelemetryOutcome;

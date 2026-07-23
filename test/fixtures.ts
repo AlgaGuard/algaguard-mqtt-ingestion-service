@@ -38,3 +38,15 @@ export const acceptedOutcome: TelemetryOutcome = {
   storedSamples: 1,
   receivedAt: "2026-07-22T10:00:11Z",
 };
+
+export const activeContext = {
+  schema: "urn:algaguard:schema:internal:device-context:v1" as const,
+  schemaVersion: "1.0.0" as const,
+  deviceUuid: "40000000-0000-4000-8000-000000000001",
+  deviceId: envelope.deviceId,
+  organizationId: "50000000-0000-4000-8000-000000000001",
+  status: "ACTIVE" as const,
+  ownershipVersion: "1",
+  resolvedAt: "2026-07-22T10:00:10Z",
+  contextVersion: "1",
+};
