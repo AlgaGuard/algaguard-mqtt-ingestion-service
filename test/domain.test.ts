@@ -4,6 +4,7 @@ import {
   DeviceContextError,
   IngestionService,
   MemoryIngestionRepository,
+  StaleDeviceContextError,
 } from "../src/domain.js";
 import { acceptedOutcome, activeContext, envelope } from "./fixtures.js";
 
@@ -206,4 +207,38 @@ test("ownership transfer is observed on the next delivery without a cache", asyn
     activeContext.organizationId,
     organizationId,
   ]);
+});
+
+test("Telemetry stale-context response triggers one authoritative re-resolution", async () => {
+  let resolutions = 0;
+  const forwardedVersions: string[] = [];
+  const service = new IngestionService(
+    new MemoryIngestionRepository(),
+    async () => {
+      resolutions += 1;
+      return {
+        ...activeContext,
+        organizationId:
+          resolutions === 1
+            ? activeContext.organizationId
+            : "50000000-0000-4000-8000-000000000002",
+        ownershipVersion: resolutions === 1 ? "1" : "2",
+      };
+    },
+  );
+  let forwards = 0;
+  const result = await service.ingest(
+    "algaguard/v1/devices/AG-000001/telemetry",
+    envelope,
+    "AG-000001",
+    async (value) => {
+      forwards += 1;
+      forwardedVersions.push(value.ownershipVersion);
+      if (forwards === 1) throw new StaleDeviceContextError();
+      return acceptedOutcome;
+    },
+  );
+  assert.equal(result.status, "ACCEPTED");
+  assert.equal(resolutions, 2);
+  assert.deepEqual(forwardedVersions, ["1", "2"]);
 });

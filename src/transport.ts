@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import mqtt, { type MqttClient } from "mqtt";
 import {
   topicDevice,
+  StaleDeviceContextError,
   type IngestionService,
   type MqttEnvelope,
   type TelemetryOutcome,
@@ -60,9 +61,11 @@ export async function forwardTelemetry(
         },
       );
       if (response.ok) return (await response.json()) as TelemetryOutcome;
+      if (response.status === 409) throw new StaleDeviceContextError();
       lastError = new Error(`Telemetry rejected batch with ${response.status}`);
       if (response.status < 500) throw lastError;
     } catch (error) {
+      if (error instanceof StaleDeviceContextError) throw error;
       lastError = error;
     }
     if (attempt < 2) {

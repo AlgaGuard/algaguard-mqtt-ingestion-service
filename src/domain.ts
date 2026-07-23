@@ -31,6 +31,11 @@ export class DeviceContextError extends Error {
     super(code);
   }
 }
+export class StaleDeviceContextError extends Error {
+  constructor() {
+    super("STALE_DEVICE_CONTEXT");
+  }
+}
 export interface TelemetryOutcome {
   batchId: string;
   deviceId: string;
@@ -171,19 +176,30 @@ export class IngestionService {
         },
       } as const;
     }
-    const outcome = await durableForward(
-      {
-        batchId: envelope.payload.batchId,
-        deviceUuid: context.deviceUuid,
-        deviceId: context.deviceId,
-        organizationId: context.organizationId,
-        ownershipVersion: context.ownershipVersion,
-        correlationId: envelope.correlationId ?? envelope.messageId,
-        activeProfile: envelope.payload.activeProfile,
-        samples: envelope.payload.samples,
-      },
-      () => this.metrics.increment("retry"),
-    );
+    const trustedBatch = (value: DeviceContext): TrustedTelemetryBatch => ({
+      batchId: envelope.payload.batchId,
+      deviceUuid: value.deviceUuid,
+      deviceId: value.deviceId,
+      organizationId: value.organizationId,
+      ownershipVersion: value.ownershipVersion,
+      correlationId: envelope.correlationId ?? envelope.messageId,
+      activeProfile: envelope.payload.activeProfile,
+      samples: envelope.payload.samples,
+    });
+    const onRetry = () => this.metrics.increment("retry");
+    let outcome: TelemetryOutcome;
+    try {
+      outcome = await durableForward(trustedBatch(context), onRetry);
+    } catch (error) {
+      if (!(error instanceof StaleDeviceContextError)) throw error;
+      onRetry();
+      context = await this.resolveDeviceContext(deviceId);
+      if (context.deviceId !== deviceId || context.status !== "ACTIVE") {
+        throw new DeviceContextError("INVALID_DEVICE_CONTEXT");
+      }
+      this.metrics.increment("context_resolved");
+      outcome = await durableForward(trustedBatch(context), onRetry);
+    }
     const stored = await this.repository.record({
       messageId: envelope.messageId,
       deviceId: envelope.deviceId,
