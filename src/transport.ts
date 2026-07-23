@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import mqtt, { type MqttClient } from "mqtt";
 import {
   topicDevice,
+  StaleDeviceContextError,
   type IngestionService,
   type MqttEnvelope,
   type TelemetryOutcome,
+  type TrustedTelemetryBatch,
 } from "./domain.js";
 
 let cachedToken: { value: string; expiresAt: number } | undefined;
@@ -40,7 +42,7 @@ async function serviceToken() {
 }
 
 export async function forwardTelemetry(
-  envelope: MqttEnvelope,
+  batch: TrustedTelemetryBatch,
   onRetry: () => void = () => {},
 ): Promise<TelemetryOutcome> {
   let lastError: unknown;
@@ -53,19 +55,17 @@ export async function forwardTelemetry(
           headers: {
             "content-type": "application/json",
             authorization: `Bearer ${await serviceToken()}`,
-            "x-correlation-id": envelope.correlationId ?? envelope.messageId,
+            "x-correlation-id": batch.correlationId,
           },
-          body: JSON.stringify({
-            batchId: envelope.payload.batchId,
-            deviceId: envelope.deviceId,
-            samples: envelope.payload.samples,
-          }),
+          body: JSON.stringify(batch),
         },
       );
       if (response.ok) return (await response.json()) as TelemetryOutcome;
+      if (response.status === 409) throw new StaleDeviceContextError();
       lastError = new Error(`Telemetry rejected batch with ${response.status}`);
       if (response.status < 500) throw lastError;
     } catch (error) {
+      if (error instanceof StaleDeviceContextError) throw error;
       lastError = error;
     }
     if (attempt < 2) {

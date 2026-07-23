@@ -1,6 +1,41 @@
 import { telemetryEnvelopeSchema } from "./validation.js";
 
 export type MqttEnvelope = ReturnType<typeof telemetryEnvelopeSchema.parse>;
+export interface DeviceContext {
+  schema: "urn:algaguard:schema:internal:device-context:v1";
+  schemaVersion: "1.0.0";
+  deviceUuid: string;
+  deviceId: string;
+  organizationId: string;
+  status: "ACTIVE";
+  ownershipVersion: string;
+  resolvedAt: string;
+  tankId?: string | undefined;
+  contextVersion?: string | undefined;
+}
+export type DeviceContextResolver = (
+  deviceId: string,
+) => Promise<DeviceContext>;
+export interface TrustedTelemetryBatch {
+  batchId: string;
+  deviceUuid: string;
+  deviceId: string;
+  organizationId: string;
+  ownershipVersion: string;
+  correlationId: string;
+  activeProfile: MqttEnvelope["payload"]["activeProfile"];
+  samples: MqttEnvelope["payload"]["samples"];
+}
+export class DeviceContextError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+  }
+}
+export class StaleDeviceContextError extends Error {
+  constructor() {
+    super("STALE_DEVICE_CONTEXT");
+  }
+}
 export interface TelemetryOutcome {
   batchId: string;
   deviceId: string;
@@ -39,7 +74,14 @@ export function topicDevice(topic: string) {
 }
 
 export class Metrics {
-  private values = { accepted: 0, rejected: 0, duplicate: 0, retry: 0 };
+  private values = {
+    accepted: 0,
+    rejected: 0,
+    duplicate: 0,
+    retry: 0,
+    context_resolved: 0,
+    context_rejected: 0,
+  };
 
   increment(name: keyof Metrics["values"]) {
     this.values[name] += 1;
@@ -55,6 +97,7 @@ export class Metrics {
 export class IngestionService {
   constructor(
     private readonly repository: IngestionRepository,
+    private readonly resolveDeviceContext: DeviceContextResolver,
     readonly metrics = new Metrics(),
   ) {}
 
@@ -63,10 +106,25 @@ export class IngestionService {
     input: unknown,
     authenticatedDeviceId: string,
     durableForward: (
-      value: MqttEnvelope,
+      value: TrustedTelemetryBatch,
       onRetry: () => void,
     ) => Promise<TelemetryOutcome>,
   ) {
+    const supplied = input as {
+      organizationId?: unknown;
+      payload?: { organizationId?: unknown };
+    } | null;
+    if (
+      supplied &&
+      (supplied.organizationId !== undefined ||
+        supplied.payload?.organizationId !== undefined)
+    ) {
+      this.metrics.increment("rejected");
+      return {
+        status: "REJECTED",
+        reason: "UNTRUSTED_ORGANIZATION_CONTEXT",
+      } as const;
+    }
     const parsed = telemetryEnvelopeSchema.safeParse(input);
     if (!parsed.success) {
       this.metrics.increment("rejected");
@@ -85,6 +143,26 @@ export class IngestionService {
         reason: "DEVICE_TOPIC_IDENTITY_MISMATCH",
       } as const;
     }
+    let context: DeviceContext;
+    try {
+      context = await this.resolveDeviceContext(deviceId);
+    } catch (error) {
+      this.metrics.increment("context_rejected");
+      this.metrics.increment("rejected");
+      if (error instanceof DeviceContextError) {
+        return { status: "REJECTED", reason: error.code } as const;
+      }
+      throw error;
+    }
+    if (context.deviceId !== deviceId || context.status !== "ACTIVE") {
+      this.metrics.increment("context_rejected");
+      this.metrics.increment("rejected");
+      return {
+        status: "REJECTED",
+        reason: "INVALID_DEVICE_CONTEXT",
+      } as const;
+    }
+    this.metrics.increment("context_resolved");
     const prior = await this.repository.find(envelope.messageId);
     if (prior) {
       this.metrics.increment("duplicate");
@@ -98,9 +176,30 @@ export class IngestionService {
         },
       } as const;
     }
-    const outcome = await durableForward(envelope, () =>
-      this.metrics.increment("retry"),
-    );
+    const trustedBatch = (value: DeviceContext): TrustedTelemetryBatch => ({
+      batchId: envelope.payload.batchId,
+      deviceUuid: value.deviceUuid,
+      deviceId: value.deviceId,
+      organizationId: value.organizationId,
+      ownershipVersion: value.ownershipVersion,
+      correlationId: envelope.correlationId ?? envelope.messageId,
+      activeProfile: envelope.payload.activeProfile,
+      samples: envelope.payload.samples,
+    });
+    const onRetry = () => this.metrics.increment("retry");
+    let outcome: TelemetryOutcome;
+    try {
+      outcome = await durableForward(trustedBatch(context), onRetry);
+    } catch (error) {
+      if (!(error instanceof StaleDeviceContextError)) throw error;
+      onRetry();
+      context = await this.resolveDeviceContext(deviceId);
+      if (context.deviceId !== deviceId || context.status !== "ACTIVE") {
+        throw new DeviceContextError("INVALID_DEVICE_CONTEXT");
+      }
+      this.metrics.increment("context_resolved");
+      outcome = await durableForward(trustedBatch(context), onRetry);
+    }
     const stored = await this.repository.record({
       messageId: envelope.messageId,
       deviceId: envelope.deviceId,
