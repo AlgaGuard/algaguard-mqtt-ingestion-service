@@ -16,6 +16,16 @@ export interface DeviceContext {
 export type DeviceContextResolver = (
   deviceId: string,
 ) => Promise<DeviceContext>;
+export interface BrokerAuthenticatedIdentity {
+  source: "emqx-mtls-acl";
+  verified: true;
+  deviceId: string;
+}
+export function brokerAuthenticatedIdentity(
+  deviceId: string,
+): BrokerAuthenticatedIdentity {
+  return { source: "emqx-mtls-acl", verified: true, deviceId };
+}
 export interface TrustedTelemetryBatch {
   batchId: string;
   deviceUuid: string;
@@ -81,6 +91,11 @@ export class Metrics {
     retry: 0,
     context_resolved: 0,
     context_rejected: 0,
+    mtls_accepted: 0,
+    credential_mismatch: 0,
+    revoked_expired_credential: 0,
+    topic_identity_mismatch: 0,
+    rate_limited: 0,
   };
 
   increment(name: keyof Metrics["values"]) {
@@ -99,21 +114,38 @@ export class IngestionService {
     private readonly repository: IngestionRepository,
     private readonly resolveDeviceContext: DeviceContextResolver,
     readonly metrics = new Metrics(),
+    private readonly maxSamplesPerBatch = 120,
   ) {}
 
   async ingest(
     topic: string,
     input: unknown,
-    authenticatedDeviceId: string,
+    authenticatedIdentity: BrokerAuthenticatedIdentity | string,
     durableForward: (
       value: TrustedTelemetryBatch,
       onRetry: () => void,
     ) => Promise<TelemetryOutcome>,
   ) {
+    const identity =
+      typeof authenticatedIdentity === "string"
+        ? brokerAuthenticatedIdentity(authenticatedIdentity)
+        : authenticatedIdentity;
     const supplied = input as {
       organizationId?: unknown;
       payload?: { organizationId?: unknown };
     } | null;
+    if (
+      identity.source !== "emqx-mtls-acl" ||
+      identity.verified !== true ||
+      !/^AG-[0-9]{6}$/.test(identity.deviceId)
+    ) {
+      this.metrics.increment("credential_mismatch");
+      this.metrics.increment("rejected");
+      return {
+        status: "REJECTED",
+        reason: "UNTRUSTED_BROKER_IDENTITY",
+      } as const;
+    }
     if (
       supplied &&
       (supplied.organizationId !== undefined ||
@@ -131,18 +163,26 @@ export class IngestionService {
       return { status: "REJECTED", reason: "INVALID_CONTRACT" } as const;
     }
     const envelope = parsed.data;
+    if (envelope.payload.samples.length > this.maxSamplesPerBatch) {
+      this.metrics.increment("rejected");
+      return { status: "REJECTED", reason: "BATCH_LIMIT_EXCEEDED" } as const;
+    }
     const deviceId = topicDevice(topic);
     if (
       !deviceId ||
       deviceId !== envelope.deviceId ||
-      authenticatedDeviceId !== deviceId
+      identity.deviceId !== deviceId
     ) {
+      this.metrics.increment("topic_identity_mismatch");
+      if (identity.deviceId !== deviceId)
+        this.metrics.increment("credential_mismatch");
       this.metrics.increment("rejected");
       return {
         status: "REJECTED",
         reason: "DEVICE_TOPIC_IDENTITY_MISMATCH",
       } as const;
     }
+    this.metrics.increment("mtls_accepted");
     let context: DeviceContext;
     try {
       context = await this.resolveDeviceContext(deviceId);
@@ -150,6 +190,8 @@ export class IngestionService {
       this.metrics.increment("context_rejected");
       this.metrics.increment("rejected");
       if (error instanceof DeviceContextError) {
+        if (/REVOKED|EXPIRED|COMPROMISED/.test(error.code))
+          this.metrics.increment("revoked_expired_credential");
         return { status: "REJECTED", reason: error.code } as const;
       }
       throw error;

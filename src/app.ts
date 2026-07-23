@@ -42,10 +42,27 @@ const requestContext: RequestHandler = (request, response, next) => {
 export function buildApp(
   repository: IngestionRepository = new MemoryIngestionRepository(),
   service = new IngestionService(repository, resolveDeviceContext),
+  httpBodyLimit = "256kb",
 ) {
   const app = express();
   app.disable("x-powered-by");
-  app.use(express.json({ limit: "256kb" }));
+  app.use(express.json({ limit: httpBodyLimit }));
+  app.use((request, response, next) => {
+    if (
+      request.header("x-device-id") ||
+      request.header("x-authenticated-device-id") ||
+      request.header("x-client-cert")
+    ) {
+      response.status(400).type("application/problem+json").json({
+        type: "about:blank",
+        title: "Untrusted proxy identity",
+        status: 400,
+        code: "UNTRUSTED_PROXY_IDENTITY",
+      });
+      return;
+    }
+    next();
+  });
   app.use(requestContext);
   app.get("/health/live", (_request, response) =>
     response.json({
