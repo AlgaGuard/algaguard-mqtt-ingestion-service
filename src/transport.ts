@@ -19,9 +19,11 @@ async function serviceToken() {
     return cachedToken.value;
   const issuer =
     process.env.KEYCLOAK_ISSUER ?? "http://keycloak:8080/realms/algaguard";
+  const tokenUrl =
+    process.env.KEYCLOAK_TOKEN_URL ?? `${issuer}/protocol/openid-connect/token`;
   const secret = process.env.SERVICE_CLIENT_SECRET;
   if (!secret) throw new Error("SERVICE_CLIENT_SECRET is required");
-  const response = await fetch(`${issuer}/protocol/openid-connect/token`, {
+  const response = await fetch(tokenUrl, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
