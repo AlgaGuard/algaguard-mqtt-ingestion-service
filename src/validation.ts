@@ -93,7 +93,7 @@ export const telemetryEnvelopeSchema = z
         firstSequence: decimalSequence,
         lastSequence: decimalSequence,
         sampleCount: z.number().int().min(1).max(120),
-        activeProfile: profileReference,
+        activeProfile: profileReference.optional(),
         samples: z.array(telemetrySample).min(1).max(120),
         isReplay: z.boolean().optional(),
         createdFromSd: z.boolean().optional(),

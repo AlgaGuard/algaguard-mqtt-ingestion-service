@@ -28,6 +28,27 @@ test("application ACK is returned only after the durable forward completes", asy
   assert.ok(await repository.find(envelope.messageId));
 });
 
+test("a batch with no activeProfile is forwarded (profile assignment routes notifications, not telemetry)", async () => {
+  const { activeProfile: _activeProfile, ...payloadWithoutProfile } =
+    envelope.payload;
+  const noProfileEnvelope = { ...envelope, payload: payloadWithoutProfile };
+  let forwardedActiveProfile: unknown = "not-called";
+  const result = await new IngestionService(
+    new MemoryIngestionRepository(),
+    resolve,
+  ).ingest(
+    "algaguard/v1/devices/AG-000001/telemetry",
+    noProfileEnvelope,
+    "AG-000001",
+    async (batch) => {
+      forwardedActiveProfile = batch.activeProfile;
+      return acceptedOutcome;
+    },
+  );
+  assert.equal(result.status, "ACCEPTED");
+  assert.equal(forwardedActiveProfile, undefined);
+});
+
 test("a persisted message is duplicate after service reconstruction and is not forwarded", async () => {
   const repository = new MemoryIngestionRepository();
   const firstService = new IngestionService(repository, resolve);
