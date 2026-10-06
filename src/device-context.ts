@@ -1,5 +1,16 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import * as grpc from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
 import { DeviceContextError, type DeviceContext } from "./domain.js";
+import {
+  createServiceTokenProvider,
+  metadataWithServiceToken,
+} from "./grpc-client.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const DEVICE_STATUS_NAME: Record<number, "ACTIVE"> = { 5: "ACTIVE" };
 
 const deviceContextSchema = z
   .object({
@@ -85,4 +96,61 @@ export async function resolveDeviceContext(
 
 export function resetDeviceContextTokenForTests() {
   cachedToken = undefined;
+}
+
+export function createGrpcDeviceContextResolver(
+  address: string,
+  environment: NodeJS.ProcessEnv = process.env,
+  tokenProvider = createServiceTokenProvider(environment),
+) {
+  const protoPath = path.resolve(here, "..", "proto", "device_service.proto");
+  const packageDefinition = protoLoader.loadSync(protoPath, {
+    keepCase: false,
+    longs: String,
+    enums: Number,
+    defaults: true,
+    oneofs: true,
+    includeDirs: [path.dirname(protoPath)],
+  });
+  const proto = grpc.loadPackageDefinition(packageDefinition) as any;
+  const client = new proto.algaguard.device.v1.DeviceLookupService(
+    address,
+    grpc.credentials.createInsecure(),
+  );
+  return async (deviceId: string): Promise<DeviceContext> => {
+    const metadata = await metadataWithServiceToken(tokenProvider);
+    const response = await new Promise<any>((resolve, reject) => {
+      client.getContextByDeviceId(
+        { deviceId },
+        metadata,
+        (error: grpc.ServiceError, value: unknown) =>
+          error ? reject(error) : resolve(value),
+      );
+    }).catch((error: grpc.ServiceError) => {
+      const [domainCode] = error.metadata?.get("x-domain-error-code") ?? [];
+      if (typeof domainCode === "string")
+        throw new DeviceContextError(domainCode);
+      if (error.code === grpc.status.NOT_FOUND)
+        throw new DeviceContextError("DEVICE_NOT_FOUND");
+      throw new DeviceContextError("DEVICE_CONTEXT_REJECTED");
+    });
+    const context = deviceContextSchema.parse({
+      schema: "urn:algaguard:schema:internal:device-context:v1",
+      schemaVersion: "1.0.0",
+      deviceUuid: response.deviceUuid,
+      deviceId: response.deviceId,
+      organizationId: response.organizationId,
+      status: DEVICE_STATUS_NAME[response.status] ?? "ACTIVE",
+      ownershipVersion: response.ownershipVersion,
+      resolvedAt: response.resolvedAt,
+      ...(response.tankId ? { tankId: response.tankId } : {}),
+      ...(response.contextVersion
+        ? { contextVersion: response.contextVersion }
+        : {}),
+    });
+    if (context.deviceId !== deviceId) {
+      throw new DeviceContextError("INVALID_DEVICE_CONTEXT");
+    }
+    return context;
+  };
 }

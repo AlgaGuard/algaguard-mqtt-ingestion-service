@@ -5,13 +5,15 @@ import { loadConfig } from "./config.js";
 import { IngestionService } from "./domain.js";
 import { PostgresIngestionRepository } from "./repository.js";
 import { startMqttIngestion } from "./transport.js";
-import { resolveDeviceContext } from "./device-context.js";
+import { createGrpcDeviceContextResolver } from "./device-context.js";
 
 const config = loadConfig();
 const repository = new PostgresIngestionRepository(createPostgresPool(config));
 const service = new IngestionService(
   repository,
-  resolveDeviceContext,
+  createGrpcDeviceContextResolver(
+    process.env.DEVICE_SERVICE_GRPC_ADDRESS ?? "device-service:50051",
+  ),
   undefined,
   config.MQTT_MAX_SAMPLES_PER_BATCH,
 );

@@ -17,15 +17,15 @@ const parameterValues = z
     temperatureC: z.number().optional(),
     ph: z.number().min(0).max(14).optional(),
     lightLux: z.number().min(0).optional(),
-    nitrateMgL: z.number().min(0).optional(),
-    phosphateMgL: z.number().min(0).optional(),
-    potassiumMgL: z.number().min(0).optional(),
+    nutrientPercent: z.number().min(0).max(100).optional(),
     batteryPercent: z.number().min(0).max(100).optional(),
     batteryVoltageV: z.number().min(0).optional(),
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0, "values must not be empty");
 const qualityFlag = z.enum([
+  "REAL",
+  "DEGRADED",
   "SIMULATED",
   "SENSOR_UNAVAILABLE",
   "OUT_OF_EXPECTED_RANGE",
